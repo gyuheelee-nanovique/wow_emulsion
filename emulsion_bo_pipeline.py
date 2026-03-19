@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import glob
@@ -16,8 +15,7 @@ from scipy import ndimage as ndi
 from skimage import filters, morphology, measure
 from skimage.segmentation import clear_border
 
-from sklearn.ensemble import RandomForestClassifier, ExtraTreesRegressor
-from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import ExtraTreesRegressor
 from skopt.space import Real
 
 
@@ -62,25 +60,6 @@ class ExperimentCondition:
 
 
 @dataclass
-class ProcessObservation:
-    stable_dripping: int = 1
-    satellite_present: int = 0
-    tailing_present: int = 0
-    nozzle_wetting: int = 0
-    immediate_coalescence: int = 0
-
-    @property
-    def feasible(self) -> int:
-        return int(
-            self.stable_dripping == 1
-            and self.satellite_present == 0
-            and self.tailing_present == 0
-            and self.nozzle_wetting == 0
-            and self.immediate_coalescence == 0
-        )
-
-
-@dataclass
 class VialMetrics:
     creaming_index: float = np.nan
 
@@ -93,7 +72,7 @@ class ObjectiveSummary:
 
 
 @dataclass
-class ImageMetricsV3:
+class ImageMetrics:
     n_detected_outer: int
     n_valid_double_emulsion: int
 
@@ -145,11 +124,6 @@ def format_time_tag(time_h: float) -> str:
 
 
 IMAGE_EXTENSIONS = ("*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp")
-LEGACY_FLOW_NAME_MAP = {
-    "q_w1_ul_min": "q_w1_ml_min",
-    "q_o_ul_min": "q_o_ml_min",
-    "q_w2_ul_min": "q_w2_ml_min",
-}
 
 
 def load_json_dict(json_path: str) -> Dict[str, object]:
@@ -160,27 +134,7 @@ def load_json_dict(json_path: str) -> Dict[str, object]:
     return data
 
 
-def normalize_legacy_flow_names_in_mapping(data: Dict[str, object]) -> Dict[str, object]:
-    out = dict(data)
-    for old_name, new_name in LEGACY_FLOW_NAME_MAP.items():
-        if old_name in out and new_name not in out:
-            out[new_name] = out[old_name]
-    return out
-
-
-def normalize_legacy_flow_names_in_df(df: pd.DataFrame) -> pd.DataFrame:
-    rename_map = {
-        old_name: new_name
-        for old_name, new_name in LEGACY_FLOW_NAME_MAP.items()
-        if old_name in df.columns and new_name not in df.columns
-    }
-    if rename_map:
-        df = df.rename(columns=rename_map)
-    return df
-
-
 def dataclass_from_dict(cls, data: Dict[str, object]):
-    data = normalize_legacy_flow_names_in_mapping(data)
     valid_names = {f.name for f in fields(cls)}
     filtered = {k: v for k, v in data.items() if k in valid_names}
     return cls(**filtered)
@@ -218,14 +172,17 @@ def discover_experiment_dirs(experiments_root: str) -> List[str]:
     return out
 
 
-def read_existing_summary(summary_csv: str) -> pd.DataFrame:
-    if not os.path.exists(summary_csv):
+def read_existing_history(history_csv: str) -> pd.DataFrame:
+    if not os.path.exists(history_csv):
         return pd.DataFrame()
-    return normalize_legacy_flow_names_in_df(pd.read_csv(summary_csv))
+    df = pd.read_csv(history_csv)
+    if "record_type" in df.columns:
+        df = df[df["record_type"].fillna("experiment").astype(str) == "experiment"].copy()
+    return df
 
 
-def existing_batch_ids_from_summary(summary_csv: str) -> set[str]:
-    df = read_existing_summary(summary_csv)
+def existing_batch_ids_from_history(history_csv: str) -> set[str]:
+    df = read_existing_history(history_csv)
     if df.empty or "batch_id" not in df.columns:
         return set()
     return {
@@ -248,74 +205,9 @@ def canonical_condition_json(cond: ExperimentCondition) -> str:
     return json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
 
 
-def condition_signature_from_condition(cond: ExperimentCondition) -> str:
-    canonical_json = canonical_condition_json(cond)
-    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
-
-
-def condition_payload_csv_value(cond: ExperimentCondition) -> str:
-    payload = {name: getattr(cond, name) for name in condition_field_names()}
-    ordered_keys = sorted(payload.keys())
-    return "|".join(f"{key}={payload[key]}" for key in ordered_keys)
-
-
-def condition_signature_from_payload(payload: Dict[str, object], batch_id: str) -> str:
-    cond = dataclass_from_dict(ExperimentCondition, payload)
-    cond.batch_id = batch_id
-    return condition_signature_from_condition(cond)
-
-
-def sha256_file(file_path: str, chunk_size: int = 1024 * 1024) -> str:
-    h = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def compute_experiment_fingerprint(experiment_dir: str) -> str:
-    condition_json = os.path.join(experiment_dir, "condition.json")
-    microscopy_dir = os.path.join(experiment_dir, "microscopy")
-    vial_image_path = find_optional_vial_image(experiment_dir)
-
-    files = [condition_json] + list_image_files(microscopy_dir)
-    if vial_image_path is not None:
-        files.append(vial_image_path)
-
-    h = hashlib.sha256()
-    for path in sorted(files):
-        rel_path = os.path.relpath(path, experiment_dir)
-        h.update(rel_path.encode("utf-8"))
-        h.update(b"\0")
-        h.update(sha256_file(path).encode("ascii"))
-        h.update(b"\0")
-    return h.hexdigest()
-
-
-def existing_fingerprint_map(summary_csv: str) -> Dict[str, str]:
-    df = read_existing_summary(summary_csv)
-    if df.empty or "batch_id" not in df.columns or "input_fingerprint" not in df.columns:
-        return {}
-
-    out: Dict[str, str] = {}
-    for _, row in df.iterrows():
-        batch_id = str(row["batch_id"]).strip() if pd.notna(row["batch_id"]) else ""
-        fingerprint = str(row["input_fingerprint"]).strip() if pd.notna(row["input_fingerprint"]) else ""
-        if batch_id and fingerprint:
-            out[batch_id] = fingerprint
-    return out
-
-
-def existing_condition_signature_map(summary_csv: str) -> Dict[str, str]:
-    df = read_existing_summary(summary_csv)
+def existing_condition_map(history_csv: str) -> Dict[str, str]:
+    df = read_existing_history(history_csv)
     if df.empty or "batch_id" not in df.columns:
-        return {}
-
-    cond_cols = [c for c in condition_field_names() if c in df.columns]
-    if not cond_cols:
         return {}
 
     out: Dict[str, str] = {}
@@ -323,13 +215,14 @@ def existing_condition_signature_map(summary_csv: str) -> Dict[str, str]:
         batch_id = str(row["batch_id"]).strip() if pd.notna(row["batch_id"]) else ""
         if not batch_id:
             continue
-
-        payload: Dict[str, object] = {}
-        for col in cond_cols:
-            if pd.notna(row[col]):
-                payload[col] = row[col]
-        payload["batch_id"] = batch_id
-        out[batch_id] = condition_signature_from_payload(payload, batch_id=batch_id)
+        payload = {
+            name: row[name]
+            for name in condition_field_names()
+            if name in row.index and pd.notna(row[name])
+        }
+        cond = dataclass_from_dict(ExperimentCondition, payload)
+        cond.batch_id = batch_id
+        out[batch_id] = canonical_condition_json(cond)
     return out
 
 
@@ -916,9 +809,9 @@ def extract_double_emulsion_objects(
 def summarize_double_emulsion_df(
     df: pd.DataFrame,
     estimated_um_per_pixel_from_scale: float = np.nan,
-) -> ImageMetricsV3:
+) -> ImageMetrics:
     if df.empty:
-        return ImageMetricsV3(
+        return ImageMetrics(
             n_detected_outer=0,
             n_valid_double_emulsion=0,
             mean_outer_diameter_um=np.nan,
@@ -973,7 +866,7 @@ def summarize_double_emulsion_df(
 
     good_fraction = float((valid_outer["is_good_double_emulsion"] == 1).mean())
 
-    return ImageMetricsV3(
+    return ImageMetrics(
         n_detected_outer=int(len(valid_outer)),
         n_valid_double_emulsion=int((valid_outer["is_good_double_emulsion"] == 1).sum()),
         mean_outer_diameter_um=mean_outer,
@@ -999,7 +892,7 @@ def summarize_double_emulsion_df(
     )
 
 
-def draw_overlay_v3(
+def draw_overlay(
     cleaned_bgr: np.ndarray,
     gray: np.ndarray,
     outer_labels: np.ndarray,
@@ -1063,7 +956,7 @@ def draw_overlay_v3(
     return overlay
 
 
-def analyze_microscopy_images_v3(
+def analyze_microscopy_images(
     image_paths: List[str],
     um_per_pixel: Optional[float],
     min_outer_diameter_um: float = 50.0,
@@ -1072,7 +965,7 @@ def analyze_microscopy_images_v3(
     try_scale_bar_estimation: bool = True,
     known_scale_um: float = 200.0,
     enable_empty_frame_relaxation: bool = True,
-) -> Tuple[pd.DataFrame, ImageMetricsV3]:
+) -> Tuple[pd.DataFrame, ImageMetrics]:
     if len(image_paths) == 0:
         empty = summarize_double_emulsion_df(pd.DataFrame(), np.nan)
         return pd.DataFrame(), empty
@@ -1131,8 +1024,8 @@ def analyze_microscopy_images_v3(
             all_rows.append(obj_df)
 
         if save_overlay_dir is not None:
-            overlay = draw_overlay_v3(cleaned_bgr, gray, outer_labels, obj_df)
-            out_name = os.path.splitext(os.path.basename(image_path))[0] + "_overlay_v3.png"
+            overlay = draw_overlay(cleaned_bgr, gray, outer_labels, obj_df)
+            out_name = os.path.splitext(os.path.basename(image_path))[0] + "_overlay.png"
             cv2.imwrite(os.path.join(save_overlay_dir, out_name), overlay)
 
     if len(all_rows) == 0:
@@ -1200,12 +1093,11 @@ def analyze_vial_image_creaming_index(image_path: str) -> VialMetrics:
 
 
 # ============================================================
-# 5. Objective function design for V3 schema
+# 5. Objective function
 # ============================================================
 
-def compute_objective_v3(
-    proc: ProcessObservation,
-    img: ImageMetricsV3,
+def compute_objective(
+    img: ImageMetrics,
     target_outer_diameter_um: float = 350.0,
     target_core_outer_ratio: float = 0.60,
     target_shell_thickness_um: Optional[float] = None,
@@ -1216,8 +1108,6 @@ def compute_objective_v3(
     """
     feasibility_penalty = 0.0
 
-    if proc.feasible == 0:
-        feasibility_penalty += 5.0
     if img.field_qc_pass == 0:
         feasibility_penalty += 2.0
     if img.n_detected_outer < 3:
@@ -1263,7 +1153,7 @@ def compute_objective_v3(
 
 
 # ============================================================
-# 6. Constrained Bayesian optimization for V3 schema
+# 6. Bayesian optimization
 # ============================================================
 
 class ObjectiveModel:
@@ -1301,71 +1191,31 @@ class ObjectiveModel:
         return mu.astype(float), sigma.astype(float)
 
 
-class FeasibilityModel:
-    """
-    Predicts P(process feasible | x).
-    """
-
-    def __init__(self, random_state: int = 42):
-        base_rf = RandomForestClassifier(
-            n_estimators=300,
-            max_depth=6,
-            min_samples_leaf=2,
-            random_state=random_state,
-            class_weight="balanced",
-            n_jobs=-1,
-        )
-        self.model = CalibratedClassifierCV(
-            estimator=base_rf,
-            method="sigmoid",
-            cv=3,
-        )
-        self.is_fitted = False
-
-    def fit(self, X: pd.DataFrame, y: pd.Series):
-        if len(X) < 12:
-            self.is_fitted = False
-            return
-        if len(np.unique(y)) < 2:
-            self.is_fitted = False
-            return
-        self.model.fit(X, y)
-        self.is_fitted = True
-
-    def predict_feasible_prob(self, X: pd.DataFrame) -> np.ndarray:
-        if not self.is_fitted:
-            return np.full(len(X), 0.5, dtype=float)
-        probs = self.model.predict_proba(X)
-        return probs[:, 1].astype(float)
-
-
 class EmulsionBOConstrainedV2:
     """
-    Constrained BO for V3 image schema.
-
-    Objective surrogate learns total_score from valid runs.
-    Feasibility surrogate learns process-level feasibility.
-    Final acquisition-like score:
-        improvement * P(feasible) + exploration * P(feasible) - soft penalty
+    BO on objective score with a soft physical penalty.
     """
 
     def __init__(self, random_state: int = 42):
         self.random_state = np.random.RandomState(random_state)
 
         self.space = [
+            Real(0.0, 20.0, name="w1_glycerol_wt"),
             Real(0.5, 2.5, name="w1_tween20_wt"),
             Real(1.0, 6.0, name="o_dextrin_palmitate_wt"),
             Real(1.0, 2.5, name="o_span80_wt"),
             Real(0.2, 0.8, name="o_adm_wt"),
+            Real(0.0, 20.0, name="w2_glycerol_wt"),
             Real(1.0, 2.5, name="w2_pva_wt"),
             Real(0.3, 2.5, name="w2_tween80_wt"),
             Real(1.0, 500.0, name="q_w1_ml_min"),
             Real(5.0, 500.0, name="q_o_ml_min"),
             Real(50.0, 500.0, name="q_w2_ml_min"),
+            Real(50.0, 500.0, name="bath_stirring_speed_rpm"),
+            Real(0.0, 0.3, name="bath_carbomer_wt"),
         ]
 
         self.objective_model = ObjectiveModel(random_state=random_state)
-        self.feasibility_model = FeasibilityModel(random_state=random_state)
         self.history: List[Dict[str, float]] = []
 
     @property
@@ -1431,7 +1281,6 @@ class EmulsionBOConstrainedV2:
         self,
         params: Dict[str, float],
         total_score: float,
-        feasible: int,
         measurement_valid: int = 1,
         field_qc_pass: Optional[int] = None,
         metadata: Optional[Dict[str, float]] = None,
@@ -1446,7 +1295,6 @@ class EmulsionBOConstrainedV2:
         )
 
         row = params.copy()
-        row["feasible"] = int(feasible)
         row["measurement_valid"] = int(measurement_valid)
         row["total_score"] = float(total_score) if np.isfinite(total_score) else np.nan
         row["penalized_score"] = float(penalized) if np.isfinite(penalized) else np.nan
@@ -1465,10 +1313,6 @@ class EmulsionBOConstrainedV2:
 
         hist = pd.DataFrame(self.history)
 
-        X_all = hist[self.param_names]
-        y_feas = hist["feasible"].astype(int)
-        self.feasibility_model.fit(X_all, y_feas)
-
         valid_mask = (
             np.isfinite(hist["total_score"].values)
             & (hist["measurement_valid"].astype(int) == 1)
@@ -1478,22 +1322,19 @@ class EmulsionBOConstrainedV2:
             qc_known = hist["field_qc_pass"].notna()
             valid_mask &= (~qc_known) | (hist["field_qc_pass"].fillna(1).astype(int) == 1)
 
-        valid_mask &= (hist["feasible"].astype(int) == 1)
-
         hist_obj = hist.loc[valid_mask].copy()
         if len(hist_obj) >= 8:
             X_obj = hist_obj[self.param_names]
             y_obj = hist_obj["total_score"].astype(float)
             self.objective_model.fit(X_obj, y_obj)
 
-    def _current_best_feasible_score(self) -> Optional[float]:
+    def _current_best_score(self) -> Optional[float]:
         if len(self.history) == 0:
             return None
 
         hist = pd.DataFrame(self.history)
         mask = (
-            (hist["feasible"].astype(int) == 1)
-            & (hist["measurement_valid"].astype(int) == 1)
+            (hist["measurement_valid"].astype(int) == 1)
             & np.isfinite(hist["total_score"].values)
         )
 
@@ -1510,70 +1351,63 @@ class EmulsionBOConstrainedV2:
         self,
         n_uniform: int = 512,
         n_local: int = 256,
-        feasibility_threshold: float = 0.30,
         exploration_weight: float = 0.25,
         penalty_weight: float = 0.20,
     ) -> Dict[str, float]:
         candidates = self._sample_uniform_candidates(n_uniform) + self._sample_local_candidates(n_local)
         cand_df = pd.DataFrame(candidates)
 
-        feas_prob = self.feasibility_model.predict_feasible_prob(cand_df)
         mu, sigma = self.objective_model.predict_mean_std(cand_df)
         penalties = np.array([self._soft_physical_penalty(r) for r in candidates], dtype=float)
 
-        y_best = self._current_best_feasible_score()
+        y_best = self._current_best_score()
 
         if y_best is None or not self.objective_model.is_fitted:
-            score = feas_prob - penalty_weight * penalties
+            score = -penalty_weight * penalties
         else:
             improvement = np.maximum(0.0, y_best - mu)
             exploration = sigma
             score = (
-                improvement * feas_prob
-                + exploration_weight * exploration * feas_prob
+                improvement
+                + exploration_weight * exploration
                 - penalty_weight * penalties
             )
 
-        gated_score = np.where(feas_prob >= feasibility_threshold, score, score - 1.0)
-        best_idx = int(np.argmax(gated_score))
+        best_idx = int(np.argmax(score))
         return candidates[best_idx]
 
     def suggest_with_diagnostics(
         self,
         n_uniform: int = 512,
         n_local: int = 256,
-        feasibility_threshold: float = 0.30,
         exploration_weight: float = 0.25,
         penalty_weight: float = 0.20,
     ) -> pd.DataFrame:
         candidates = self._sample_uniform_candidates(n_uniform) + self._sample_local_candidates(n_local)
         cand_df = pd.DataFrame(candidates)
 
-        feas_prob = self.feasibility_model.predict_feasible_prob(cand_df)
         mu, sigma = self.objective_model.predict_mean_std(cand_df)
         penalties = np.array([self._soft_physical_penalty(r) for r in candidates], dtype=float)
 
-        y_best = self._current_best_feasible_score()
+        y_best = self._current_best_score()
 
         if y_best is None or not self.objective_model.is_fitted:
             improvement = np.zeros(len(candidates), dtype=float)
-            score = feas_prob - penalty_weight * penalties
+            score = -penalty_weight * penalties
         else:
             improvement = np.maximum(0.0, y_best - mu)
             score = (
-                improvement * feas_prob
-                + exploration_weight * sigma * feas_prob
+                improvement
+                + exploration_weight * sigma
                 - penalty_weight * penalties
             )
 
         out = cand_df.copy()
-        out["pred_feasible_prob"] = feas_prob
         out["pred_objective_mean"] = mu
         out["pred_objective_std"] = sigma
         out["pred_improvement"] = improvement
         out["soft_physical_penalty"] = penalties
         out["acquisition_score"] = score
-        out["passes_feasibility_gate"] = (feas_prob >= feasibility_threshold).astype(int)
 
         return out.sort_values("acquisition_score", ascending=False).reset_index(drop=True)
 
@@ -1587,23 +1421,70 @@ class EmulsionBOConstrainedV2:
 # 7. Data registration and BO fitting
 # ============================================================
 
-def register_result_v3(
+def build_history_column_order(df: pd.DataFrame) -> List[str]:
+    condition_cols = [name for name in condition_field_names() if name != "batch_id"]
+    preferred = [
+        "record_type",
+        "batch_id",
+        *condition_cols,
+        "n_detected_outer",
+        "n_valid_double_emulsion",
+        "mean_outer_diameter_um",
+        "median_outer_diameter_um",
+        "std_outer_diameter_um",
+        "cv_outer_percent",
+        "pdi_outer_img",
+        "mean_inner_diameter_um",
+        "mean_shell_thickness_um",
+        "std_shell_thickness_um",
+        "cv_shell_percent",
+        "mean_core_outer_ratio",
+        "std_core_outer_ratio",
+        "mean_concentricity_ratio",
+        "mean_outer_circularity",
+        "mean_inner_circularity",
+        "weak_core_fraction",
+        "truncated_fraction",
+        "failed_inner_detection_fraction",
+        "good_double_emulsion_fraction",
+        "estimated_um_per_pixel_from_scale",
+        "field_qc_pass",
+        "creaming_index",
+        "objective_value",
+        "feasibility_penalty",
+        "total_score",
+        "measurement_valid",
+        "pred_objective_mean",
+        "pred_objective_std",
+        "pred_improvement",
+        "soft_physical_penalty",
+        "acquisition_score",
+    ]
+    ordered = [col for col in preferred if col in df.columns]
+    ordered.extend(col for col in df.columns if col not in ordered)
+    return ordered
+
+
+def finalize_history_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.replace([np.inf, -np.inf], np.nan).copy()
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if numeric_cols:
+        df[numeric_cols] = df[numeric_cols].astype(float).round(3)
+    return df[build_history_column_order(df)]
+
+
+def register_result(
     out_csv: str,
     cond: ExperimentCondition,
-    proc: ProcessObservation,
-    img: ImageMetricsV3,
+    img: ImageMetrics,
     vial: Optional[VialMetrics],
     obj: ObjectiveSummary,
-    input_fingerprint: Optional[str] = None,
-    analysis_version: str = "microscopy_v3",
-    objective_version: str = "objective_v3",
-    bo_version: str = "cbo_v2_v3schema",
 ):
     row = {}
+    row["record_type"] = "experiment"
     row.update(asdict(cond))
-    row["condition_signature"] = condition_signature_from_condition(cond)
-    row.update(asdict(proc))
-    row["feasible"] = proc.feasible
     row.update(asdict(img))
 
     if vial is not None:
@@ -1620,43 +1501,30 @@ def register_result_v3(
     )
 
     row["measurement_valid"] = measurement_valid
-    row["analysis_version"] = analysis_version
-    row["objective_version"] = objective_version
-    row["bo_version"] = bo_version
-    row["input_fingerprint"] = input_fingerprint if input_fingerprint is not None else ""
 
     if os.path.exists(out_csv):
-        df = pd.read_csv(out_csv)
+        df = read_existing_history(out_csv)
         if "batch_id" in df.columns:
             df = df[df["batch_id"].astype(str) != str(cond.batch_id)].copy()
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     else:
         df = pd.DataFrame([row])
 
-    df.to_csv(out_csv, index=False)
+    df = finalize_history_frame(df)
+    df.to_csv(out_csv, index=False, float_format="%.3f")
     return df
 
 
-def fit_bo_from_summary_v3(
-    summary_csv: str,
-    analysis_version: Optional[str] = None,
-    objective_version: Optional[str] = None,
-    bo_version: Optional[str] = None,
+def fit_bo_from_history(
+    history_csv: str,
 ) -> EmulsionBOConstrainedV2:
-    df = normalize_legacy_flow_names_in_df(pd.read_csv(summary_csv))
+    df = read_existing_history(history_csv)
     bo = EmulsionBOConstrainedV2(random_state=42)
 
-    required_cols = bo.param_names + ["total_score", "feasible"]
+    required_cols = bo.param_names + ["total_score"]
     missing_cols = [c for c in required_cols if c not in df.columns]
     if len(missing_cols) > 0:
-        raise ValueError(f"Missing required columns in summary CSV: {missing_cols}")
-
-    if analysis_version is not None and "analysis_version" in df.columns:
-        df = df[df["analysis_version"] == analysis_version].copy()
-    if objective_version is not None and "objective_version" in df.columns:
-        df = df[df["objective_version"] == objective_version].copy()
-    if bo_version is not None and "bo_version" in df.columns:
-        df = df[df["bo_version"] == bo_version].copy()
+        raise ValueError(f"Missing required columns in history CSV: {missing_cols}")
 
     if "measurement_valid" not in df.columns:
         if "field_qc_pass" in df.columns:
@@ -1670,11 +1538,11 @@ def fit_bo_from_summary_v3(
     if "field_qc_pass" not in df.columns:
         df["field_qc_pass"] = np.nan
 
-    for c in bo.param_names + ["total_score", "feasible", "measurement_valid"]:
+    for c in bo.param_names + ["total_score", "measurement_valid"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df = df.dropna(subset=bo.param_names + ["feasible"]).copy()
+    df = df.dropna(subset=bo.param_names).copy()
 
     for k, dim in zip(bo.param_names, bo.space):
         df = df[(df[k] >= dim.low) & (df[k] <= dim.high)]
@@ -1702,7 +1570,6 @@ def fit_bo_from_summary_v3(
     for _, row in df.iterrows():
         params = {k: float(row[k]) for k in bo.param_names}
         total_score = float(row["total_score"]) if np.isfinite(row["total_score"]) else np.nan
-        feasible = int(row["feasible"])
         measurement_valid = int(row["measurement_valid"]) if np.isfinite(row["measurement_valid"]) else 0
 
         field_qc_pass = None
@@ -1722,7 +1589,6 @@ def fit_bo_from_summary_v3(
         bo.tell(
             params=params,
             total_score=total_score,
-            feasible=feasible,
             measurement_valid=measurement_valid,
             field_qc_pass=field_qc_pass,
             metadata=metadata,
@@ -1737,7 +1603,7 @@ def fit_bo_from_summary_v3(
 
 def load_experiment_inputs_from_dir(
     experiment_dir: str,
-) -> Tuple[ExperimentCondition, ProcessObservation, Optional[float]]:
+) -> Tuple[ExperimentCondition, Optional[float]]:
     condition_json_path = os.path.join(experiment_dir, "condition.json")
 
     payload = load_json_dict(condition_json_path)
@@ -1746,24 +1612,19 @@ def load_experiment_inputs_from_dir(
     um_per_pixel = float(um_per_pixel_raw) if um_per_pixel_raw is not None else None
 
     condition = dataclass_from_dict(ExperimentCondition, payload)
-    # Process feasibility is now user-filtered upstream, so every analyzed
-    # experiment is treated as feasible by default.
-    process_observation = ProcessObservation()
-    return condition, process_observation, um_per_pixel
+    return condition, um_per_pixel
 
 
-def analyze_one_condition_v3(
+def analyze_one_condition(
     microscopy_dir: str,
     um_per_pixel: Optional[float],
     batch_id: str,
     time_h: float,
     condition: ExperimentCondition,
-    process_observation: ProcessObservation,
-    out_summary_csv: str = "experiment_summary_v3.csv",
+    out_history_csv: str = "bo_history.csv",
     vial_image_path: Optional[str] = None,
     overlay_dir: Optional[str] = None,
     droplets_csv_path: Optional[str] = None,
-    input_fingerprint: Optional[str] = None,
     target_outer_diameter_um: float = 350.0,
     target_core_outer_ratio: float = 0.60,
     target_shell_thickness_um: Optional[float] = None,
@@ -1775,7 +1636,7 @@ def analyze_one_condition_v3(
     if len(image_paths) == 0:
         raise ValueError(f"No microscopy images found in directory: {microscopy_dir}")
 
-    droplet_df, img_metrics = analyze_microscopy_images_v3(
+    droplet_df, img_metrics = analyze_microscopy_images(
         image_paths=image_paths,
         um_per_pixel=um_per_pixel,
         min_outer_diameter_um=50.0,
@@ -1792,39 +1653,33 @@ def analyze_one_condition_v3(
     condition_local.batch_id = batch_id
     condition_local.time_h = time_h
 
-    objective = compute_objective_v3(
-        proc=process_observation,
+    objective = compute_objective(
         img=img_metrics,
         target_outer_diameter_um=target_outer_diameter_um,
         target_core_outer_ratio=target_core_outer_ratio,
         target_shell_thickness_um=target_shell_thickness_um,
     )
 
-    df = register_result_v3(
-        out_csv=out_summary_csv,
+    df = register_result(
+        out_csv=out_history_csv,
         cond=condition_local,
-        proc=process_observation,
         img=img_metrics,
         vial=vial_metrics,
         obj=objective,
-        input_fingerprint=input_fingerprint,
-        analysis_version="microscopy_v3",
-        objective_version="objective_v3",
-        bo_version="cbo_v2_v3schema",
     )
 
     if not droplet_df.empty:
         droplets_csv = droplets_csv_path
         if droplets_csv is None:
-            droplets_csv = "droplets_v3.csv"
+            droplets_csv = "droplets.csv"
         droplet_df.to_csv(droplets_csv, index=False)
 
     return df
 
 
-def analyze_experiment_dir_v3(
+def analyze_experiment_dir(
     experiment_dir: str,
-    out_summary_csv: str = "experiment_summary_v3.csv",
+    out_history_csv: str = "bo_history.csv",
     overlay_root: Optional[str] = None,
     target_outer_diameter_um: float = 350.0,
     target_core_outer_ratio: float = 0.60,
@@ -1834,8 +1689,7 @@ def analyze_experiment_dir_v3(
 ) -> pd.DataFrame:
     microscopy_dir = os.path.join(experiment_dir, "microscopy")
 
-    condition, process_observation, um_per_pixel = load_experiment_inputs_from_dir(experiment_dir)
-    input_fingerprint = compute_experiment_fingerprint(experiment_dir)
+    condition, um_per_pixel = load_experiment_inputs_from_dir(experiment_dir)
 
     exp_name = os.path.basename(os.path.abspath(experiment_dir))
     batch_id = exp_name
@@ -1848,23 +1702,21 @@ def analyze_experiment_dir_v3(
 
     droplets_csv_path = os.path.join(
         experiment_dir,
-        "droplets_v3.csv",
+        "droplets.csv",
     )
 
     vial_image_path = find_optional_vial_image(experiment_dir)
 
-    return analyze_one_condition_v3(
+    return analyze_one_condition(
         microscopy_dir=microscopy_dir,
         um_per_pixel=um_per_pixel,
         batch_id=batch_id,
         time_h=time_h,
         condition=condition,
-        process_observation=process_observation,
-        out_summary_csv=out_summary_csv,
+        out_history_csv=out_history_csv,
         vial_image_path=vial_image_path,
         overlay_dir=overlay_dir,
         droplets_csv_path=droplets_csv_path,
-        input_fingerprint=input_fingerprint,
         target_outer_diameter_um=target_outer_diameter_um,
         target_core_outer_ratio=target_core_outer_ratio,
         target_shell_thickness_um=target_shell_thickness_um,
@@ -1873,9 +1725,9 @@ def analyze_experiment_dir_v3(
     )
 
 
-def run_experiment_batch_v3(
+def run_experiment_batch(
     experiments_root: str = "./experiments",
-    out_summary_csv: str = "experiment_summary_v3.csv",
+    out_history_csv: str = "bo_history.csv",
     overlay_root: Optional[str] = None,
     target_outer_diameter_um: float = 350.0,
     target_core_outer_ratio: float = 0.60,
@@ -1891,35 +1743,29 @@ def run_experiment_batch_v3(
             "'experiments/exp_001' with condition.json and microscopy/."
         )
 
-    existing_batch_ids = existing_batch_ids_from_summary(out_summary_csv) if skip_unchanged_batches else set()
-    existing_fingerprints = existing_fingerprint_map(out_summary_csv) if skip_unchanged_batches else {}
-    existing_condition_signatures = (
-        existing_condition_signature_map(out_summary_csv) if skip_unchanged_batches else {}
-    )
+    existing_batch_ids = existing_batch_ids_from_history(out_history_csv) if skip_unchanged_batches else set()
+    existing_conditions = existing_condition_map(out_history_csv) if skip_unchanged_batches else {}
 
-    df_last = read_existing_summary(out_summary_csv)
+    df_last = read_existing_history(out_history_csv)
     for experiment_dir in experiment_dirs:
         batch_id = os.path.basename(os.path.abspath(experiment_dir))
-        fingerprint = compute_experiment_fingerprint(experiment_dir)
         condition_payload = load_json_dict(os.path.join(experiment_dir, "condition.json"))
-        condition_signature = condition_signature_from_payload(condition_payload, batch_id=batch_id)
-        previous_fingerprint = existing_fingerprints.get(batch_id)
-        previous_condition_signature = existing_condition_signatures.get(batch_id)
+        condition_local = dataclass_from_dict(ExperimentCondition, condition_payload)
+        condition_local.batch_id = batch_id
+        current_condition_text = canonical_condition_json(condition_local)
+        previous_condition_text = existing_conditions.get(batch_id)
 
         is_unchanged = False
-        if batch_id in existing_batch_ids:
-            if previous_fingerprint:
-                is_unchanged = previous_fingerprint == fingerprint
-            elif previous_condition_signature:
-                is_unchanged = previous_condition_signature == condition_signature
+        if batch_id in existing_batch_ids and previous_condition_text:
+            is_unchanged = previous_condition_text == current_condition_text
 
         if is_unchanged:
             print(f"[skip] batch_id and inputs unchanged: {batch_id}")
             continue
 
-        df_last = analyze_experiment_dir_v3(
+        df_last = analyze_experiment_dir(
             experiment_dir=experiment_dir,
-            out_summary_csv=out_summary_csv,
+            out_history_csv=out_history_csv,
             overlay_root=overlay_root,
             target_outer_diameter_um=target_outer_diameter_um,
             target_core_outer_ratio=target_core_outer_ratio,
@@ -1951,21 +1797,17 @@ def remove_tree_if_exists(path: str):
     os.rmdir(path)
 
 
-def reset_analysis_outputs_v3(
+def reset_analysis_outputs(
     experiments_root: str = "./experiments",
-    out_summary_csv: str = "experiment_summary_v3.csv",
+    out_history_csv: str = "bo_history.csv",
     overlay_root: Optional[str] = None,
-    suggestion_csv_path: str = "bo_candidate_diagnostics_v3.csv",
-    history_csv_path: str = "bo_history_v3.csv",
-    bo_visualization_path: str = "bo_visualization_v3.png",
+    bo_visualization_path: str = "bo_visualization.png",
 ):
-    remove_file_if_exists(out_summary_csv)
-    remove_file_if_exists(suggestion_csv_path)
-    remove_file_if_exists(history_csv_path)
+    remove_file_if_exists(out_history_csv)
     remove_file_if_exists(bo_visualization_path)
 
     for experiment_dir in discover_experiment_dirs(experiments_root):
-        remove_file_if_exists(os.path.join(experiment_dir, "droplets_v3.csv"))
+        remove_file_if_exists(os.path.join(experiment_dir, "droplets.csv"))
         if overlay_root is None:
             remove_tree_if_exists(os.path.join(experiment_dir, "overlays"))
         else:
@@ -1973,20 +1815,60 @@ def reset_analysis_outputs_v3(
             remove_tree_if_exists(os.path.join(overlay_root, exp_name))
 
 
-def save_bo_summary_outputs(
-    bo: EmulsionBOConstrainedV2,
-    diag: pd.DataFrame,
-    suggestion_csv_path: str = "bo_candidate_diagnostics_v3.csv",
-    history_csv_path: str = "bo_history_v3.csv",
+def build_suggested_condition_row(
+    experiment_df: pd.DataFrame,
+    suggestion_params: Dict[str, float],
+) -> Dict[str, object]:
+    base = ExperimentCondition()
+
+    if not experiment_df.empty:
+        last_row = experiment_df.iloc[-1]
+        for field_name in condition_field_names():
+            if field_name in last_row.index and pd.notna(last_row[field_name]):
+                setattr(base, field_name, last_row[field_name])
+
+    for k, v in suggestion_params.items():
+        if hasattr(base, k):
+            setattr(base, k, float(v))
+
+    base.batch_id = "suggested_next_experiment"
+    return asdict(base)
+
+
+def save_bo_history_with_suggestion(
+    experiment_csv_path: str,
+    suggestion_df: pd.DataFrame,
 ):
-    diag.head(1).to_csv(suggestion_csv_path, index=False)
-    bo.history_df().to_csv(history_csv_path, index=False)
+    experiment_df = read_existing_history(experiment_csv_path)
+    if suggestion_df.empty:
+        finalize_history_frame(experiment_df).to_csv(
+            experiment_csv_path,
+            index=False,
+            float_format="%.3f",
+        )
+        return
+
+    top = suggestion_df.iloc[0].to_dict()
+    suggestion_params = {
+        k: float(top[k])
+        for k in suggestion_df.columns
+        if k in condition_field_names() and pd.notna(top[k])
+    }
+    suggestion_row: Dict[str, object] = {"record_type": "suggestion"}
+    suggestion_row.update(build_suggested_condition_row(experiment_df, suggestion_params))
+
+    for key, value in top.items():
+        suggestion_row[key] = value
+
+    out_df = pd.concat([experiment_df, pd.DataFrame([suggestion_row])], ignore_index=True, sort=False)
+    out_df = finalize_history_frame(out_df)
+    out_df.to_csv(experiment_csv_path, index=False, float_format="%.3f")
 
 
-def save_bo_visualization_v3(
+def save_bo_visualization(
     bo: EmulsionBOConstrainedV2,
     diag: pd.DataFrame,
-    out_png: str = "bo_visualization_v3.png",
+    out_png: str = "bo_visualization.png",
     top_n: int = 40,
 ):
     mpl_cache_dir = os.path.join("/tmp", "wow_emulsion_mpl_cache")
@@ -2080,17 +1962,8 @@ def save_bo_visualization_v3(
         ax.set_title("Top Candidate Uncertainty")
     else:
         ax.bar(ranks, rank_df["acquisition_score"].astype(float).values, color="#1f77b4", alpha=0.85)
-        ax.plot(
-            ranks,
-            rank_df["pred_feasible_prob"].astype(float).values,
-            color="orange",
-            marker="o",
-            linewidth=1.5,
-            label="pred feasible prob",
-        )
-        ax.set_ylabel("Acquisition Score / Feasible Prob")
+        ax.set_ylabel("Acquisition Score")
         ax.set_title("Top Candidates (Surrogate not fitted yet)")
-        ax.legend(loc="best")
 
     ax.axvline(1, color="red", linestyle="--", linewidth=1.2)
     ax.set_xlabel("Candidate Rank")
@@ -2108,7 +1981,7 @@ def save_bo_visualization_v3(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze experiment folders and fit constrained BO suggestions."
+        description="Analyze experiment folders and fit BO suggestions."
     )
     parser.add_argument(
         "--experiments-root",
@@ -2116,9 +1989,9 @@ def main():
         help="Directory containing experiment subfolders.",
     )
     parser.add_argument(
-        "--out-summary-csv",
-        default="experiment_summary_v3.csv",
-        help="Output CSV for aggregated experiment summaries.",
+        "--out-history-csv",
+        default="bo_history.csv",
+        help="Output CSV for experiment history and appended BO suggestion.",
     )
     parser.add_argument(
         "--overlay-root",
@@ -2152,7 +2025,7 @@ def main():
     parser.add_argument(
         "--force-reprocess",
         action="store_true",
-        help="Re-run batches even if the batch_id and inputs are unchanged from the summary CSV.",
+        help="Re-run batches even if the batch_id and inputs are unchanged from the history CSV.",
     )
     parser.add_argument(
         "--reset-analysis",
@@ -2172,23 +2045,20 @@ def main():
     )
     args = parser.parse_args()
 
-    suggestion_csv_path = "bo_candidate_diagnostics_v3.csv"
-    history_csv_path = "bo_history_v3.csv"
-    bo_visualization_path = "bo_visualization_v3.png"
+    history_csv_path = args.out_history_csv
+    bo_visualization_path = "bo_visualization.png"
 
     if args.reset_analysis:
-        reset_analysis_outputs_v3(
+        reset_analysis_outputs(
             experiments_root=args.experiments_root,
-            out_summary_csv=args.out_summary_csv,
+            out_history_csv=args.out_history_csv,
             overlay_root=args.overlay_root,
-            suggestion_csv_path=suggestion_csv_path,
-            history_csv_path=history_csv_path,
             bo_visualization_path=bo_visualization_path,
         )
 
-    run_experiment_batch_v3(
+    run_experiment_batch(
         experiments_root=args.experiments_root,
-        out_summary_csv=args.out_summary_csv,
+        out_history_csv=args.out_history_csv,
         overlay_root=args.overlay_root,
         target_outer_diameter_um=args.target_outer_diameter_um,
         target_core_outer_ratio=args.target_core_outer_ratio,
@@ -2198,33 +2068,33 @@ def main():
         enable_empty_frame_relaxation=not args.no_empty_frame_relaxation,
     )
 
-    bo = fit_bo_from_summary_v3(
-        args.out_summary_csv,
-        analysis_version="microscopy_v3",
-        objective_version="objective_v3",
-        bo_version="cbo_v2_v3schema",
-    )
+    bo = fit_bo_from_history(args.out_history_csv)
 
     diag = bo.suggest_with_diagnostics(
         n_uniform=512,
         n_local=256,
-        feasibility_threshold=0.35,
         exploration_weight=0.25,
         penalty_weight=0.20,
     )
-    suggestion = diag.iloc[0][bo.param_names].to_dict()
+    experiment_history_df = read_existing_history(args.out_history_csv)
+    suggestion = build_suggested_condition_row(
+        experiment_df=experiment_history_df,
+        suggestion_params=diag.iloc[0][bo.param_names].to_dict(),
+    )
 
     print("=== Suggested next experiment ===")
-    for k, v in suggestion.items():
-        print(f"{k}: {v:.4f}")
+    for field_name in condition_field_names():
+        value = suggestion[field_name]
+        if isinstance(value, (int, float, np.floating)) and not isinstance(value, bool):
+            print(f"{field_name}: {float(value):.3f}")
+        else:
+            print(f"{field_name}: {value}")
 
-    save_bo_summary_outputs(
-        bo=bo,
-        diag=diag,
-        suggestion_csv_path=suggestion_csv_path,
-        history_csv_path=history_csv_path,
+    save_bo_history_with_suggestion(
+        experiment_csv_path=history_csv_path,
+        suggestion_df=diag,
     )
-    save_bo_visualization_v3(
+    save_bo_visualization(
         bo=bo,
         diag=diag,
         out_png=bo_visualization_path,

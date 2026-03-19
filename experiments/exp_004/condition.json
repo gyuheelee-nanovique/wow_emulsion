@@ -15,7 +15,7 @@
   "w1_conductivity_mScm": 0.05,
   "w2_conductivity_mScm": 0.05,
   "temperature_C": 25.0,
-  "bath_stirring_speed_rpm": 80.0,
+  "bath_stirring_speed_rpm": 100.0,
   "bath_carbomer_wt": 0.2,
   "time_h": 0.0,
   "operator": "BS"

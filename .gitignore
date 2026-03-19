@@ -6,10 +6,8 @@ __pycache__/
 
 .venv/
 
-experiment_summary_v3.csv
-bo_candidate_diagnostics_v3.csv
-bo_history_v3.csv
-bo_visualization_v3.png
+bo_history.csv
+bo_visualization.png
 
 # Keep only exp_001 ~ exp_005 under experiments/
 experiments/*
@@ -25,5 +23,5 @@ experiments/*
 !experiments/exp_005/**
 
 experiments/**/.DS_Store
-experiments/*/droplets_v3.csv
+experiments/*/droplets.csv
 experiments/*/overlays/
