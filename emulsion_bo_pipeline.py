@@ -196,6 +196,24 @@ def condition_field_names() -> List[str]:
     return [f.name for f in fields(ExperimentCondition)]
 
 
+def bo_variable_names() -> List[str]:
+    return [
+        "w1_glycerol_wt",
+        "w1_tween20_wt",
+        "o_dextrin_palmitate_wt",
+        "o_span80_wt",
+        "o_adm_wt",
+        "w2_glycerol_wt",
+        "w2_pva_wt",
+        "w2_tween80_wt",
+        "q_w1_ml_min",
+        "q_o_ml_min",
+        "q_w2_ml_min",
+        "bath_stirring_speed_rpm",
+        "bath_carbomer_wt",
+    ]
+
+
 def canonical_condition_payload(cond: ExperimentCondition) -> Dict[str, object]:
     return {name: getattr(cond, name) for name in condition_field_names()}
 
@@ -1422,11 +1440,17 @@ class EmulsionBOConstrainedV2:
 # ============================================================
 
 def build_history_column_order(df: pd.DataFrame) -> List[str]:
-    condition_cols = [name for name in condition_field_names() if name != "batch_id"]
+    bo_cols = [name for name in bo_variable_names() if name != "batch_id"]
+    condition_record_cols = [
+        name
+        for name in condition_field_names()
+        if name not in {"batch_id", *bo_cols}
+    ]
     preferred = [
         "record_type",
         "batch_id",
-        *condition_cols,
+        *bo_cols,
+        *condition_record_cols,
         "n_detected_outer",
         "n_valid_double_emulsion",
         "mean_outer_diameter_um",
