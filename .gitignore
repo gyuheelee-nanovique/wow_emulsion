@@ -9,7 +9,7 @@ __pycache__/
 bo_history.csv
 bo_visualization.png
 
-# Keep only exp_001 ~ exp_005 under experiments/
+# Keep only exp_001 ~ exp_008 under experiments/
 experiments/*
 !experiments/exp_001/
 !experiments/exp_001/**
@@ -21,6 +21,12 @@ experiments/*
 !experiments/exp_004/**
 !experiments/exp_005/
 !experiments/exp_005/**
+!experiments/exp_006/
+!experiments/exp_006/**
+!experiments/exp_007/
+!experiments/exp_007/**
+!experiments/exp_008/
+!experiments/exp_008/**
 
 experiments/**/.DS_Store
 experiments/*/droplets.csv

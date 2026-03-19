@@ -1202,11 +1202,19 @@ class ObjectiveModel:
         )
         self.is_fitted = False
 
+    @staticmethod
+    def _to_feature_array(X: pd.DataFrame | np.ndarray) -> np.ndarray:
+        if isinstance(X, pd.DataFrame):
+            return X.to_numpy(dtype=float, copy=False)
+        return np.asarray(X, dtype=float)
+
     def fit(self, X: pd.DataFrame, y: pd.Series):
         if len(X) < 8:
             self.is_fitted = False
             return
-        self.model.fit(X, y)
+        X_arr = self._to_feature_array(X)
+        y_arr = np.asarray(y, dtype=float)
+        self.model.fit(X_arr, y_arr)
         self.is_fitted = True
 
     def predict_mean_std(self, X: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
@@ -1215,7 +1223,8 @@ class ObjectiveModel:
             sigma = np.zeros(len(X), dtype=float)
             return mu, sigma
 
-        all_tree_preds = np.vstack([est.predict(X) for est in self.model.estimators_])
+        X_arr = self._to_feature_array(X)
+        all_tree_preds = np.vstack([est.predict(X_arr) for est in self.model.estimators_])
         mu = np.mean(all_tree_preds, axis=0)
         sigma = np.std(all_tree_preds, axis=0, ddof=1) if all_tree_preds.shape[0] > 1 else np.zeros(len(X), dtype=float)
         return mu.astype(float), sigma.astype(float)
