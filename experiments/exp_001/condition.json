@@ -1,0 +1,22 @@
+{
+  "w1_glycerol_wt": 10.0,
+  "w1_tween20_wt": 2.0,
+  "o_dextrin_palmitate_wt": 5.0,
+  "o_span80_wt": 2.0,
+  "o_adm_wt": 0.5,
+  "w2_glycerol_wt": 10.0,
+  "w2_pva_wt": 2.0,
+  "w2_tween80_wt": 2.0,
+  "q_w1_ul_min": 5.0,
+  "q_o_ul_min": 10.0,
+  "q_w2_ul_min": 130.0,
+  "w1_pH": 7.0,
+  "w2_pH": 7.0,
+  "w1_conductivity_mScm": 0.05,
+  "w2_conductivity_mScm": 0.05,
+  "temperature_C": 25.0,
+  "bath_stirring_speed_rpm": 300.0,
+  "bath_carbomer_wt": 0.2,
+  "time_h": 0.0,
+  "operator": "BS"
+}

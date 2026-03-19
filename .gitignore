@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.venv/
+
+experiment_summary_v3.csv
+bo_candidate_diagnostics_v3.csv
+bo_history_v3.csv
+bo_visualization_v3.png
+
+experiments/*/droplets_v3.csv
+experiments/*/overlays/
