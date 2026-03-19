@@ -11,5 +11,19 @@ bo_candidate_diagnostics_v3.csv
 bo_history_v3.csv
 bo_visualization_v3.png
 
+# Keep only exp_001 ~ exp_005 under experiments/
+experiments/*
+!experiments/exp_001/
+!experiments/exp_001/**
+!experiments/exp_002/
+!experiments/exp_002/**
+!experiments/exp_003/
+!experiments/exp_003/**
+!experiments/exp_004/
+!experiments/exp_004/**
+!experiments/exp_005/
+!experiments/exp_005/**
+
+experiments/**/.DS_Store
 experiments/*/droplets_v3.csv
 experiments/*/overlays/
