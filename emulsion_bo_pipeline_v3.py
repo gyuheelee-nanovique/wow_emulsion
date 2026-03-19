@@ -41,10 +41,10 @@ class ExperimentCondition:
     w2_pva_wt: float = 2.0
     w2_tween80_wt: float = 0.75
 
-    # Flow [uL/min]
-    q_w1_ul_min: float = 30.0
-    q_o_ul_min: float = 120.0
-    q_w2_ul_min: float = 900.0
+    # Flow [mL/min]
+    q_w1_ml_min: float = 30.0
+    q_o_ml_min: float = 120.0
+    q_w2_ml_min: float = 900.0
 
     # Hidden / controlled variables
     w1_pH: float = 7.0
@@ -145,6 +145,11 @@ def format_time_tag(time_h: float) -> str:
 
 
 IMAGE_EXTENSIONS = ("*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp")
+LEGACY_FLOW_NAME_MAP = {
+    "q_w1_ul_min": "q_w1_ml_min",
+    "q_o_ul_min": "q_o_ml_min",
+    "q_w2_ul_min": "q_w2_ml_min",
+}
 
 
 def load_json_dict(json_path: str) -> Dict[str, object]:
@@ -155,7 +160,27 @@ def load_json_dict(json_path: str) -> Dict[str, object]:
     return data
 
 
+def normalize_legacy_flow_names_in_mapping(data: Dict[str, object]) -> Dict[str, object]:
+    out = dict(data)
+    for old_name, new_name in LEGACY_FLOW_NAME_MAP.items():
+        if old_name in out and new_name not in out:
+            out[new_name] = out[old_name]
+    return out
+
+
+def normalize_legacy_flow_names_in_df(df: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {
+        old_name: new_name
+        for old_name, new_name in LEGACY_FLOW_NAME_MAP.items()
+        if old_name in df.columns and new_name not in df.columns
+    }
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
 def dataclass_from_dict(cls, data: Dict[str, object]):
+    data = normalize_legacy_flow_names_in_mapping(data)
     valid_names = {f.name for f in fields(cls)}
     filtered = {k: v for k, v in data.items() if k in valid_names}
     return cls(**filtered)
@@ -196,7 +221,7 @@ def discover_experiment_dirs(experiments_root: str) -> List[str]:
 def read_existing_summary(summary_csv: str) -> pd.DataFrame:
     if not os.path.exists(summary_csv):
         return pd.DataFrame()
-    return pd.read_csv(summary_csv)
+    return normalize_legacy_flow_names_in_df(pd.read_csv(summary_csv))
 
 
 def existing_batch_ids_from_summary(summary_csv: str) -> set[str]:
@@ -214,9 +239,24 @@ def condition_field_names() -> List[str]:
     return [f.name for f in fields(ExperimentCondition)]
 
 
-def condition_signature_from_condition(cond: ExperimentCondition) -> str:
-    payload = {name: getattr(cond, name) for name in condition_field_names()}
+def canonical_condition_payload(cond: ExperimentCondition) -> Dict[str, object]:
+    return {name: getattr(cond, name) for name in condition_field_names()}
+
+
+def canonical_condition_json(cond: ExperimentCondition) -> str:
+    payload = canonical_condition_payload(cond)
     return json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+
+
+def condition_signature_from_condition(cond: ExperimentCondition) -> str:
+    canonical_json = canonical_condition_json(cond)
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
+def condition_payload_csv_value(cond: ExperimentCondition) -> str:
+    payload = {name: getattr(cond, name) for name in condition_field_names()}
+    ordered_keys = sorted(payload.keys())
+    return "|".join(f"{key}={payload[key]}" for key in ordered_keys)
 
 
 def condition_signature_from_payload(payload: Dict[str, object], batch_id: str) -> str:
@@ -364,10 +404,41 @@ def preprocess_double_emulsion_image(bgr: np.ndarray) -> Tuple[np.ndarray, np.nd
     return cleaned, gray, flat_dark
 
 
+def _filter_outer_regions(
+    label_img: np.ndarray,
+    min_outer_diameter_px: float,
+    max_outer_diameter_px: float,
+    circularity_min: float,
+    solidity_min: float,
+) -> np.ndarray:
+    out = np.zeros_like(label_img, dtype=np.int32)
+    new_id = 1
+
+    for region in measure.regionprops(label_img):
+        eqd = float(region.equivalent_diameter_area)
+        if not (min_outer_diameter_px <= eqd <= max_outer_diameter_px):
+            continue
+
+        area = float(region.area)
+        perim = float(max(region.perimeter, 1e-12))
+        circ = 4.0 * np.pi * area / (perim ** 2)
+        solidity = float(region.solidity)
+
+        if circ < circularity_min or solidity < solidity_min:
+            continue
+
+        coords = region.coords
+        out[coords[:, 0], coords[:, 1]] = new_id
+        new_id += 1
+
+    return out
+
+
 def segment_outer_droplets(
     flat_dark_emphasis: np.ndarray,
     min_outer_diameter_px: float = 80.0,
-    max_outer_diameter_px: float = 900.0,
+    max_outer_diameter_px: float = 1800.0,
+    enable_empty_frame_relaxation: bool = True,
 ) -> np.ndarray:
     """
     Segment OUTER droplet contour for dark-shell / bright-core image morphology.
@@ -385,25 +456,22 @@ def segment_outer_droplets(
     mask = clear_border(mask)
 
     label_img = measure.label(mask)
-    out = np.zeros_like(label_img, dtype=np.int32)
+    out = _filter_outer_regions(
+        label_img=label_img,
+        min_outer_diameter_px=min_outer_diameter_px,
+        max_outer_diameter_px=max_outer_diameter_px,
+        circularity_min=0.65,
+        solidity_min=0.90,
+    )
 
-    new_id = 1
-    for region in measure.regionprops(label_img):
-        eqd = float(region.equivalent_diameter_area)
-        if not (min_outer_diameter_px <= eqd <= max_outer_diameter_px):
-            continue
-
-        area = float(region.area)
-        perim = float(max(region.perimeter, 1e-12))
-        circ = 4.0 * np.pi * area / (perim ** 2)
-        solidity = float(region.solidity)
-
-        if circ < 0.65 or solidity < 0.90:
-            continue
-
-        coords = region.coords
-        out[coords[:, 0], coords[:, 1]] = new_id
-        new_id += 1
+    if np.max(out) == 0 and enable_empty_frame_relaxation:
+        out = _filter_outer_regions(
+            label_img=label_img,
+            min_outer_diameter_px=min_outer_diameter_px,
+            max_outer_diameter_px=max_outer_diameter_px,
+            circularity_min=0.50,
+            solidity_min=0.88,
+        )
 
     return out
 
@@ -999,10 +1067,11 @@ def analyze_microscopy_images_v3(
     image_paths: List[str],
     um_per_pixel: Optional[float],
     min_outer_diameter_um: float = 50.0,
-    max_outer_diameter_um: float = 1000.0,
+    max_outer_diameter_um: float = 2000.0,
     save_overlay_dir: Optional[str] = None,
     try_scale_bar_estimation: bool = True,
     known_scale_um: float = 200.0,
+    enable_empty_frame_relaxation: bool = True,
 ) -> Tuple[pd.DataFrame, ImageMetricsV3]:
     if len(image_paths) == 0:
         empty = summarize_double_emulsion_df(pd.DataFrame(), np.nan)
@@ -1047,6 +1116,7 @@ def analyze_microscopy_images_v3(
             flat_dark_emphasis=flat_dark,
             min_outer_diameter_px=min_outer_diameter_px,
             max_outer_diameter_px=max_outer_diameter_px,
+            enable_empty_frame_relaxation=enable_empty_frame_relaxation,
         )
 
         obj_df = extract_double_emulsion_objects(
@@ -1284,14 +1354,14 @@ class EmulsionBOConstrainedV2:
 
         self.space = [
             Real(0.5, 2.5, name="w1_tween20_wt"),
-            Real(4.0, 6.0, name="o_dextrin_palmitate_wt"),
+            Real(1.0, 6.0, name="o_dextrin_palmitate_wt"),
             Real(1.0, 2.5, name="o_span80_wt"),
             Real(0.2, 0.8, name="o_adm_wt"),
             Real(1.0, 2.5, name="w2_pva_wt"),
             Real(0.3, 2.5, name="w2_tween80_wt"),
-            Real(1.0, 100.0, name="q_w1_ul_min"),
-            Real(5.0, 220.0, name="q_o_ul_min"),
-            Real(50.0, 1800.0, name="q_w2_ul_min"),
+            Real(1.0, 500.0, name="q_w1_ml_min"),
+            Real(5.0, 500.0, name="q_o_ml_min"),
+            Real(50.0, 500.0, name="q_w2_ml_min"),
         ]
 
         self.objective_model = ObjectiveModel(random_state=random_state)
@@ -1338,9 +1408,9 @@ class EmulsionBOConstrainedV2:
         return out
 
     def _soft_physical_penalty(self, params: Dict[str, float]) -> float:
-        q_w1 = params["q_w1_ul_min"]
-        q_o = params["q_o_ul_min"]
-        q_w2 = params["q_w2_ul_min"]
+        q_w1 = params["q_w1_ml_min"]
+        q_o = params["q_o_ml_min"]
+        q_w2 = params["q_w2_ml_min"]
 
         r_core = ratio_core(q_w1, q_o)
         r_sheath = ratio_sheath(q_w1, q_o, q_w2)
@@ -1573,7 +1643,7 @@ def fit_bo_from_summary_v3(
     objective_version: Optional[str] = None,
     bo_version: Optional[str] = None,
 ) -> EmulsionBOConstrainedV2:
-    df = pd.read_csv(summary_csv)
+    df = normalize_legacy_flow_names_in_df(pd.read_csv(summary_csv))
     bo = EmulsionBOConstrainedV2(random_state=42)
 
     required_cols = bo.param_names + ["total_score", "feasible"]
@@ -1698,6 +1768,7 @@ def analyze_one_condition_v3(
     target_core_outer_ratio: float = 0.60,
     target_shell_thickness_um: Optional[float] = None,
     known_scale_um: float = 200.0,
+    enable_empty_frame_relaxation: bool = True,
 ) -> pd.DataFrame:
     image_paths = list_image_files(microscopy_dir)
 
@@ -1708,10 +1779,11 @@ def analyze_one_condition_v3(
         image_paths=image_paths,
         um_per_pixel=um_per_pixel,
         min_outer_diameter_um=50.0,
-        max_outer_diameter_um=1000.0,
+        max_outer_diameter_um=2000.0,
         save_overlay_dir=overlay_dir,
         try_scale_bar_estimation=True,
         known_scale_um=known_scale_um,
+        enable_empty_frame_relaxation=enable_empty_frame_relaxation,
     )
 
     vial_metrics = analyze_vial_image_creaming_index(vial_image_path) if vial_image_path else VialMetrics(np.nan)
@@ -1758,6 +1830,7 @@ def analyze_experiment_dir_v3(
     target_core_outer_ratio: float = 0.60,
     target_shell_thickness_um: Optional[float] = None,
     known_scale_um: float = 200.0,
+    enable_empty_frame_relaxation: bool = True,
 ) -> pd.DataFrame:
     microscopy_dir = os.path.join(experiment_dir, "microscopy")
 
@@ -1796,6 +1869,7 @@ def analyze_experiment_dir_v3(
         target_core_outer_ratio=target_core_outer_ratio,
         target_shell_thickness_um=target_shell_thickness_um,
         known_scale_um=known_scale_um,
+        enable_empty_frame_relaxation=enable_empty_frame_relaxation,
     )
 
 
@@ -1808,6 +1882,7 @@ def run_experiment_batch_v3(
     target_shell_thickness_um: Optional[float] = None,
     known_scale_um: float = 200.0,
     skip_unchanged_batches: bool = True,
+    enable_empty_frame_relaxation: bool = True,
 ) -> pd.DataFrame:
     experiment_dirs = discover_experiment_dirs(experiments_root)
     if len(experiment_dirs) == 0:
@@ -1850,6 +1925,7 @@ def run_experiment_batch_v3(
             target_core_outer_ratio=target_core_outer_ratio,
             target_shell_thickness_um=target_shell_thickness_um,
             known_scale_um=known_scale_um,
+            enable_empty_frame_relaxation=enable_empty_frame_relaxation,
         )
 
     return df_last
@@ -1929,15 +2005,15 @@ def save_bo_visualization_v3(
     hist_df = bo.history_df().copy()
     suggestion = plot_df.iloc[0]
 
-    plot_df["core_ratio"] = plot_df["q_w1_ul_min"] / np.maximum(plot_df["q_o_ul_min"], 1e-12)
-    plot_df["sheath_ratio"] = plot_df["q_w2_ul_min"] / np.maximum(
-        plot_df["q_w1_ul_min"] + plot_df["q_o_ul_min"], 1e-12
+    plot_df["core_ratio"] = plot_df["q_w1_ml_min"] / np.maximum(plot_df["q_o_ml_min"], 1e-12)
+    plot_df["sheath_ratio"] = plot_df["q_w2_ml_min"] / np.maximum(
+        plot_df["q_w1_ml_min"] + plot_df["q_o_ml_min"], 1e-12
     )
 
     if not hist_df.empty:
-        hist_df["core_ratio"] = hist_df["q_w1_ul_min"] / np.maximum(hist_df["q_o_ul_min"], 1e-12)
-        hist_df["sheath_ratio"] = hist_df["q_w2_ul_min"] / np.maximum(
-            hist_df["q_w1_ul_min"] + hist_df["q_o_ul_min"], 1e-12
+        hist_df["core_ratio"] = hist_df["q_w1_ml_min"] / np.maximum(hist_df["q_o_ml_min"], 1e-12)
+        hist_df["sheath_ratio"] = hist_df["q_w2_ml_min"] / np.maximum(
+            hist_df["q_w1_ml_min"] + hist_df["q_o_ml_min"], 1e-12
         )
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -1969,9 +2045,9 @@ def save_bo_visualization_v3(
             zorder=3,
         )
 
-    sugg_core_ratio = float(suggestion["q_w1_ul_min"]) / max(float(suggestion["q_o_ul_min"]), 1e-12)
-    sugg_sheath_ratio = float(suggestion["q_w2_ul_min"]) / max(
-        float(suggestion["q_w1_ul_min"] + suggestion["q_o_ul_min"]),
+    sugg_core_ratio = float(suggestion["q_w1_ml_min"]) / max(float(suggestion["q_o_ml_min"]), 1e-12)
+    sugg_sheath_ratio = float(suggestion["q_w2_ml_min"]) / max(
+        float(suggestion["q_w1_ml_min"] + suggestion["q_o_ml_min"]),
         1e-12,
     )
     ax.scatter(
@@ -2086,6 +2162,14 @@ def main():
             "keeping the experiments folders and input files."
         ),
     )
+    parser.add_argument(
+        "--no-empty-frame-relaxation",
+        action="store_true",
+        help=(
+            "Disable the fallback that relaxes outer-droplet shape filtering when a frame "
+            "would otherwise produce zero detections."
+        ),
+    )
     args = parser.parse_args()
 
     suggestion_csv_path = "bo_candidate_diagnostics_v3.csv"
@@ -2111,6 +2195,7 @@ def main():
         target_shell_thickness_um=args.target_shell_thickness_um,
         known_scale_um=args.known_scale_um,
         skip_unchanged_batches=not args.force_reprocess,
+        enable_empty_frame_relaxation=not args.no_empty_frame_relaxation,
     )
 
     bo = fit_bo_from_summary_v3(
