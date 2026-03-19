@@ -690,9 +690,21 @@ def detect_inner_core_in_roi(
 
 def _region_basic_geom(region, um_per_pixel: float) -> Dict[str, float]:
     area = float(region.area)
-    perim = float(max(region.perimeter, 1e-12))
+    perim_raw = float(region.perimeter)
+    perim = float(perim_raw) if np.isfinite(perim_raw) else np.nan
     eqd_px = float(region.equivalent_diameter_area)
-    circ = float(4.0 * np.pi * area / (perim ** 2))
+    if (
+        not np.isfinite(area)
+        or not np.isfinite(perim)
+        or eqd_px < 3.0
+        or area <= 1.0
+        or perim <= 1.0
+    ):
+        circ = np.nan
+    else:
+        circ = float(4.0 * np.pi * area / (perim ** 2))
+        if not np.isfinite(circ) or circ <= 0.0 or circ > 1.2:
+            circ = np.nan
     solidity = float(region.solidity)
 
     return {
