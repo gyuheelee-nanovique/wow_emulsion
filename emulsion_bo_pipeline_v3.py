@@ -1855,6 +1855,48 @@ def run_experiment_batch_v3(
     return df_last
 
 
+def remove_file_if_exists(path: str):
+    if os.path.isfile(path):
+        os.remove(path)
+
+
+def remove_tree_if_exists(path: str):
+    if not os.path.exists(path):
+        return
+    if os.path.isfile(path):
+        os.remove(path)
+        return
+
+    for root, dirnames, filenames in os.walk(path, topdown=False):
+        for filename in filenames:
+            os.remove(os.path.join(root, filename))
+        for dirname in dirnames:
+            os.rmdir(os.path.join(root, dirname))
+    os.rmdir(path)
+
+
+def reset_analysis_outputs_v3(
+    experiments_root: str = "./experiments",
+    out_summary_csv: str = "experiment_summary_v3.csv",
+    overlay_root: Optional[str] = None,
+    suggestion_csv_path: str = "bo_candidate_diagnostics_v3.csv",
+    history_csv_path: str = "bo_history_v3.csv",
+    bo_visualization_path: str = "bo_visualization_v3.png",
+):
+    remove_file_if_exists(out_summary_csv)
+    remove_file_if_exists(suggestion_csv_path)
+    remove_file_if_exists(history_csv_path)
+    remove_file_if_exists(bo_visualization_path)
+
+    for experiment_dir in discover_experiment_dirs(experiments_root):
+        remove_file_if_exists(os.path.join(experiment_dir, "droplets_v3.csv"))
+        if overlay_root is None:
+            remove_tree_if_exists(os.path.join(experiment_dir, "overlays"))
+        else:
+            exp_name = os.path.basename(os.path.abspath(experiment_dir))
+            remove_tree_if_exists(os.path.join(overlay_root, exp_name))
+
+
 def save_bo_summary_outputs(
     bo: EmulsionBOConstrainedV2,
     diag: pd.DataFrame,
@@ -2036,7 +2078,29 @@ def main():
         action="store_true",
         help="Re-run batches even if the batch_id and inputs are unchanged from the summary CSV.",
     )
+    parser.add_argument(
+        "--reset-analysis",
+        action="store_true",
+        help=(
+            "Delete existing analysis outputs and rebuild everything from scratch while "
+            "keeping the experiments folders and input files."
+        ),
+    )
     args = parser.parse_args()
+
+    suggestion_csv_path = "bo_candidate_diagnostics_v3.csv"
+    history_csv_path = "bo_history_v3.csv"
+    bo_visualization_path = "bo_visualization_v3.png"
+
+    if args.reset_analysis:
+        reset_analysis_outputs_v3(
+            experiments_root=args.experiments_root,
+            out_summary_csv=args.out_summary_csv,
+            overlay_root=args.overlay_root,
+            suggestion_csv_path=suggestion_csv_path,
+            history_csv_path=history_csv_path,
+            bo_visualization_path=bo_visualization_path,
+        )
 
     run_experiment_batch_v3(
         experiments_root=args.experiments_root,
@@ -2072,13 +2136,13 @@ def main():
     save_bo_summary_outputs(
         bo=bo,
         diag=diag,
-        suggestion_csv_path="bo_candidate_diagnostics_v3.csv",
-        history_csv_path="bo_history_v3.csv",
+        suggestion_csv_path=suggestion_csv_path,
+        history_csv_path=history_csv_path,
     )
     save_bo_visualization_v3(
         bo=bo,
         diag=diag,
-        out_png="bo_visualization_v3.png",
+        out_png=bo_visualization_path,
     )
 
 

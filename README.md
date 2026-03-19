@@ -80,6 +80,12 @@ python emulsion_bo_pipeline_v3.py --experiments-root ./experiments
 python emulsion_bo_pipeline_v3.py --experiments-root ./experiments --force-reprocess
 ```
 
+기존 분석 결과만 지우고 `experiments/` 입력은 유지한 채 처음부터 다시 돌리려면:
+
+```bash
+python emulsion_bo_pipeline_v3.py --experiments-root ./experiments --reset-analysis
+```
+
 ## 재실행 시 동작
 
 코드는 각 실험 폴더에 대해 `input_fingerprint`를 계산합니다.
@@ -92,9 +98,20 @@ fingerprint 계산 대상:
 
 동작 규칙:
 
-- 같은 `batch_id`이고 fingerprint도 같으면 해당 실험은 건너뜁니다.
-- 같은 `batch_id`인데 입력 파일이 바뀌면 기존 row를 갱신합니다.
+- 같은 `batch_id`이고 입력도 같으면 해당 실험은 건너뜁니다.
+- 같은 `batch_id`라도 `condition.json` 또는 이미지가 바뀌면 다시 분석하고 기존 row를 갱신합니다.
 - 같은 입력으로 반복 실행해도 summary에 중복 행이 계속 쌓이지 않습니다.
+
+`--reset-analysis`를 사용하면 아래 분석 산출물만 삭제한 뒤 전체 실험을 처음부터 다시 계산합니다.
+
+- `experiment_summary_v3.csv`
+- `bo_candidate_diagnostics_v3.csv`
+- `bo_history_v3.csv`
+- `bo_visualization_v3.png`
+- 각 실험 폴더의 `droplets_v3.csv`
+- 각 실험 폴더의 `overlays/`
+
+이때 `condition.json`, `microscopy/`, 선택적인 `vial.*` 같은 입력 파일은 유지됩니다.
 
 ## 출력 파일
 
