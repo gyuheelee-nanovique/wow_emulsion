@@ -210,6 +210,21 @@ def existing_batch_ids_from_summary(summary_csv: str) -> set[str]:
     }
 
 
+def condition_field_names() -> List[str]:
+    return [f.name for f in fields(ExperimentCondition)]
+
+
+def condition_signature_from_condition(cond: ExperimentCondition) -> str:
+    payload = {name: getattr(cond, name) for name in condition_field_names()}
+    return json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+
+
+def condition_signature_from_payload(payload: Dict[str, object], batch_id: str) -> str:
+    cond = dataclass_from_dict(ExperimentCondition, payload)
+    cond.batch_id = batch_id
+    return condition_signature_from_condition(cond)
+
+
 def sha256_file(file_path: str, chunk_size: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
     with open(file_path, "rb") as f:
@@ -251,6 +266,30 @@ def existing_fingerprint_map(summary_csv: str) -> Dict[str, str]:
         fingerprint = str(row["input_fingerprint"]).strip() if pd.notna(row["input_fingerprint"]) else ""
         if batch_id and fingerprint:
             out[batch_id] = fingerprint
+    return out
+
+
+def existing_condition_signature_map(summary_csv: str) -> Dict[str, str]:
+    df = read_existing_summary(summary_csv)
+    if df.empty or "batch_id" not in df.columns:
+        return {}
+
+    cond_cols = [c for c in condition_field_names() if c in df.columns]
+    if not cond_cols:
+        return {}
+
+    out: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        batch_id = str(row["batch_id"]).strip() if pd.notna(row["batch_id"]) else ""
+        if not batch_id:
+            continue
+
+        payload: Dict[str, object] = {}
+        for col in cond_cols:
+            if pd.notna(row[col]):
+                payload[col] = row[col]
+        payload["batch_id"] = batch_id
+        out[batch_id] = condition_signature_from_payload(payload, batch_id=batch_id)
     return out
 
 
@@ -1492,6 +1531,7 @@ def register_result_v3(
 ):
     row = {}
     row.update(asdict(cond))
+    row["condition_signature"] = condition_signature_from_condition(cond)
     row.update(asdict(proc))
     row["feasible"] = proc.feasible
     row.update(asdict(img))
@@ -1767,7 +1807,7 @@ def run_experiment_batch_v3(
     target_core_outer_ratio: float = 0.60,
     target_shell_thickness_um: Optional[float] = None,
     known_scale_um: float = 200.0,
-    skip_existing_batch_ids: bool = True,
+    skip_unchanged_batches: bool = True,
 ) -> pd.DataFrame:
     experiment_dirs = discover_experiment_dirs(experiments_root)
     if len(experiment_dirs) == 0:
@@ -1776,19 +1816,30 @@ def run_experiment_batch_v3(
             "'experiments/exp_001' with condition.json and microscopy/."
         )
 
-    existing_batch_ids = existing_batch_ids_from_summary(out_summary_csv) if skip_existing_batch_ids else set()
-    existing_fingerprints = existing_fingerprint_map(out_summary_csv) if skip_existing_batch_ids else {}
+    existing_batch_ids = existing_batch_ids_from_summary(out_summary_csv) if skip_unchanged_batches else set()
+    existing_fingerprints = existing_fingerprint_map(out_summary_csv) if skip_unchanged_batches else {}
+    existing_condition_signatures = (
+        existing_condition_signature_map(out_summary_csv) if skip_unchanged_batches else {}
+    )
 
     df_last = read_existing_summary(out_summary_csv)
     for experiment_dir in experiment_dirs:
         batch_id = os.path.basename(os.path.abspath(experiment_dir))
         fingerprint = compute_experiment_fingerprint(experiment_dir)
+        condition_payload = load_json_dict(os.path.join(experiment_dir, "condition.json"))
+        condition_signature = condition_signature_from_payload(condition_payload, batch_id=batch_id)
+        previous_fingerprint = existing_fingerprints.get(batch_id)
+        previous_condition_signature = existing_condition_signatures.get(batch_id)
 
-        if (
-            batch_id in existing_batch_ids
-            and existing_fingerprints.get(batch_id) == fingerprint
-        ):
-            print(f"[skip] batch_id unchanged: {batch_id}")
+        is_unchanged = False
+        if batch_id in existing_batch_ids:
+            if previous_fingerprint:
+                is_unchanged = previous_fingerprint == fingerprint
+            elif previous_condition_signature:
+                is_unchanged = previous_condition_signature == condition_signature
+
+        if is_unchanged:
+            print(f"[skip] batch_id and inputs unchanged: {batch_id}")
             continue
 
         df_last = analyze_experiment_dir_v3(
@@ -1983,7 +2034,7 @@ def main():
     parser.add_argument(
         "--force-reprocess",
         action="store_true",
-        help="Re-run batches even if their batch_id already exists in the summary CSV.",
+        help="Re-run batches even if the batch_id and inputs are unchanged from the summary CSV.",
     )
     args = parser.parse_args()
 
@@ -1995,7 +2046,7 @@ def main():
         target_core_outer_ratio=args.target_core_outer_ratio,
         target_shell_thickness_um=args.target_shell_thickness_um,
         known_scale_um=args.known_scale_um,
-        skip_existing_batch_ids=not args.force_reprocess,
+        skip_unchanged_batches=not args.force_reprocess,
     )
 
     bo = fit_bo_from_summary_v3(
